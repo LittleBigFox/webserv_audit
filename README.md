@@ -14,6 +14,8 @@ Universal Linux Web Server Audit Script
 
 The script does not collect or display any personal or confidential data. It is safe to use on any compatible Linux server.
 
+The script can be used with any AI Assistant if necessary, for faster analysis.
+
 ## Usage
 
 ```bash
