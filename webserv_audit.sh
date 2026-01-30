@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# =====================================================================
+# Dépendances recommandées pour un audit optimal :
+#   apt install apache2-utils sysstat mysql-client php lsb-release coreutils procps grep awk sed
+#
+# - apache2-utils : pour apachectl/apache2ctl
+# - sysstat        : pour iostat
+# - mysql-client   : pour mysql
+# - php            : pour php -i
+# - lsb-release    : pour lsb_release (si besoin)
+# - coreutils, procps, grep, awk, sed : outils shell standards
+# =====================================================================
+
 # Paramètres
 SLOW_LOG="${SLOW_LOG:-/var/log/mysql/slow.log}"
 OUT="${1:-/webserv/webserv_audit.log}"
@@ -98,6 +110,17 @@ compute_mpm_effective() {
   echo -n "Cores: "; grep -c '^processor' /proc/cpuinfo
   echo -n "RAM total: "; free -h | awk '/Mem:/ {print $2}'
   echo -n "RAM disponible: "; free -h | awk '/Mem:/ {print $7}'
+  echo
+  echo "[free -h] Vue synthétique de la mémoire (total/used/free/shared/buffers/cache/available) :"
+  free -h
+  echo
+  echo "[vmstat] Statistiques système (mémoire, swap, IO, CPU) sur 2 intervalles :"
+  if command -v vmstat >/dev/null 2>&1; then
+    vmstat 2 2
+  else
+    echo "(commande vmstat non trouvée)"
+  fi
+  echo "(Colonne 'si/so' = swap in/out, 'us' = user CPU, 'sy' = system CPU, 'id' = idle, 'wa' = IO wait)"
   # Swap: gérer les systèmes sans swap en lisant /proc/meminfo
   SWAP_KB_TOTAL=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)
   SWAP_KB_FREE=$(awk '/^SwapFree:/ {print $2}' /proc/meminfo)
@@ -119,6 +142,13 @@ compute_mpm_effective() {
   echo -n "Apache version: "; $APACHECTL -v 2>/dev/null | grep 'Server version' || apache2 -v 2>/dev/null | grep 'Server version' || echo "(inconnu)"
   echo -n "MPM: "; $APACHECTL -V 2>/dev/null | grep -i mpm || echo "(inconnu)"
   echo -n "Config principale: "; $APACHECTL -V 2>/dev/null | grep SERVER_CONFIG_FILE | cut -d'"' -f2 || echo "(inconnu)"
+  echo
+  echo "== Modules Apache actifs =="
+  if [[ -n "$APACHECTL" ]]; then
+    $APACHECTL -M 2>/dev/null || echo "(commande apachectl -M échouée)"
+  else
+    echo "(apachectl non trouvé, impossible de lister les modules)"
+  fi
   echo
 
   echo "== PHP =="
