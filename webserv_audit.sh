@@ -307,10 +307,36 @@ FROM (
   q "SELECT table_schema, table_name, engine, ROUND(data_length/1024/1024,1) AS data_MB, ROUND(index_length/1024/1024,1) AS idx_MB, ROUND((data_length+index_length)/1024/1024,1) AS total_MB FROM information_schema.tables WHERE table_schema NOT IN ('mysql','information_schema','performance_schema','sys') ORDER BY (data_length+index_length) DESC LIMIT 10;"
   echo
 
-    echo "== Profiling requêtes sans slow_log (Performance Schema) =="
-  echo "[Note] Ce serveur n'utilise pas le slow_log MariaDB; utilisation de Performance Schema pour l'observabilité."
+    echo "== Profiling SQL (slow_log ou Performance Schema) =="
   PS_STATE=$(q "SHOW VARIABLES LIKE 'performance_schema';" | awk '{print tolower($2)}' | tr -d '\r' || true)
-  if [[ "$PS_STATE" == "on" || "$PS_STATE" == "1" ]]; then
+  SLOW_ON=$(q "SHOW VARIABLES LIKE 'slow_query_log';" | awk '{print tolower($2)}' | tr -d '\r' || true)
+  SLOW_FILE=$(q "SHOW VARIABLES LIKE 'slow_query_log_file';" | awk '{print $2}' | tr -d '\r' || true)
+
+  if [[ "$SLOW_ON" == "on" && -n "$SLOW_FILE" && -r "$SLOW_FILE" ]]; then
+    echo "-- Analyse slow query log: $SLOW_FILE --"
+    # Prefer mariadb-dumpslow (MariaDB>=10.5) then mysqldumpslow, fallback to awk
+    DUMPSLOW_CMD=""
+    if command -v mariadb-dumpslow >/dev/null 2>&1; then
+      DUMPSLOW_CMD="mariadb-dumpslow"
+    elif command -v mysqldumpslow >/dev/null 2>&1; then
+      DUMPSLOW_CMD="mysqldumpslow"
+    fi
+
+    if [[ -n "$DUMPSLOW_CMD" ]]; then
+      echo "-- Top 20 par temps total ($DUMPSLOW_CMD -s t) --"
+      "$DUMPSLOW_CMD" -s t -t 20 "$SLOW_FILE" 2>/dev/null || true
+      echo
+      echo "-- Top 20 par occurrences ($DUMPSLOW_CMD -s c) --"
+      "$DUMPSLOW_CMD" -s c -t 20 "$SLOW_FILE" 2>/dev/null || true
+    else
+      echo "[i] ni mariadb-dumpslow ni mysqldumpslow trouvés, utilisation d'un résumé awk (approx.)"
+      awk '
+        /^# Query_time:/ { qt=$3; q=""; getline; q=$0; gsub(/^[ \t]+|[ \t]+$/, "", q); cnt[q]+=1; sum[q]+=qt; if(max[q]=="" || qt+0>max[q]) max[q]=qt }
+        END{ printf("count avg_qt max_qt query\n"); for (k in cnt) printf("%d %.6f %.6f %s\n", cnt[k], sum[k]/cnt[k], max[k], k) }'
+        "$SLOW_FILE" | sort -nr | head -n 20 || true
+    fi
+    echo
+  elif [[ "$PS_STATE" == "on" || "$PS_STATE" == "1" ]]; then
     echo "-- Top requêtes par temps total (digest) --"
       q "SELECT DIGEST,
       MIN(LEFT(DIGEST_TEXT, 300)) AS DIGEST_TEXT,
@@ -410,7 +436,7 @@ FROM (
       echo "[i] Schéma 'sys' absent. Pour analyses avancées, installez le sys schema (souvent fourni avec MariaDB/MySQL)."
     fi
   else
-    echo "[!] performance_schema est désactivé. Activez-le pour ce profilage (ajouter performance_schema=ON puis redémarrer MariaDB)."
+    echo "[i] Ni slow_log fichier ni Performance Schema disponibles pour le profiling SQL. Activez l'un des deux."
   fi
   echo
 
@@ -438,6 +464,142 @@ FROM (
 
     echo
     compute_mpm_effective
+    echo
+    echo "== Vhosts et logs d'accès =="
+    AP_SITES=$($APACHECTL -S 2>/dev/null || true)
+    if [[ -n "$AP_SITES" ]]; then
+      echo "-- Vhosts détectés (443/80) --"
+      awk 'match($0, /port[[:space:]]+([0-9]+)[[:space:]]+namevhost[[:space:]]+([^[:space:]]+)/, m){printf("port %s %s\n", m[1], m[2])}' <<<"$AP_SITES" | sort -u
+    else
+      echo "(apachectl -S non disponible)"
+    fi
+
+    # Collecte des fichiers d'accès potentiels
+    declare -a CAND_LOGS=()
+    while IFS= read -r p; do [[ -n "$p" ]] && CAND_LOGS+=("$p"); done < <(grep -hE "^\s*CustomLog\s+(/[^\s]+)" -o /etc/apache2/sites-enabled/*.conf 2>/dev/null | awk '{print $2}' | sed 's/"//g')
+    for p in /var/log/apache2/*access*.log /var/log/apache2/other-vhosts-access.log /var/log/apache2/access.log; do [[ -f "$p" ]] && CAND_LOGS+=("$p"); done
+    # Dédupliquer
+    mapfile -t CAND_LOGS < <(printf "%s\n" "${CAND_LOGS[@]}" | awk '!seen[$0]++')
+    BEST_LOG=""; BEST_SIZE=0
+    for p in "${CAND_LOGS[@]}"; do
+      [[ -r "$p" ]] || continue
+      sz=$(stat -c %s "$p" 2>/dev/null || echo 0)
+      if [[ "$sz" =~ ^[0-9]+$ ]] && (( sz > BEST_SIZE )); then
+        BEST_SIZE=$sz; BEST_LOG="$p"
+      fi
+    done
+    if [[ -n "$BEST_LOG" ]]; then
+      echo "-- Log d'accès sélectionné: $BEST_LOG (taille: $BEST_SIZE octets) --"
+    else
+      echo "[i] Aucun log d'accès lisible trouvé."
+    fi
+
+    # Mapping CustomLog -> ServerName/ServerAlias (pour logs par vhost)
+    declare -A LOG2DOMAIN
+    for cf in /etc/apache2/sites-enabled/*.conf; do
+      [[ -r "$cf" ]] || continue
+      awk '
+        BEGIN{dom=""}
+        /^[\t ]*#/ {next}
+        /<VirtualHost[[:space:]]/ {dom=""}
+        match($0, /^[\t ]*ServerName[[:space:]]+([^\t ]+)/, m){dom=m[1]}
+        match($0, /^[\t ]*ServerAlias[[:space:]]+([^\t ]+)/, m){ if(dom=="") dom=m[1] }
+        match($0, /^[\t ]*CustomLog[[:space:]]+([^\t ]+)/, m){ if(dom!=""){ gsub(/"/, "", m[1]); printf("%s\t%s\n", m[1], dom) } }
+      ' "$cf" 2>/dev/null | while IFS=$'\t' read -r lp dm; do LOG2DOMAIN["$lp"]="$dm"; done
+    done
+
+    # Choix du domaine et de la page la plus demandée à partir du log sélectionné
+    CHOSEN_DOMAIN=""; CHOSEN_PATH=""
+    if [[ -n "$BEST_LOG" ]]; then
+      # 1) other-vhosts-access.log: domaine dans la 1ère colonne (vhost:port)
+      CHOSEN_DOMAIN=$(awk 'match($1, /^([^:]+):/, m){dom=m[1]; cnt[dom]++} END{max=0; d=""; for (k in cnt){if(cnt[k]>max){max=cnt[k]; d=k}} if(d!=""){print d}}' "$BEST_LOG" 2>/dev/null || true)
+      # 2) Si non trouvé, utiliser mapping CustomLog -> ServerName
+      if [[ -z "$CHOSEN_DOMAIN" && -n "${LOG2DOMAIN[$BEST_LOG]:-}" ]]; then
+        CHOSEN_DOMAIN="${LOG2DOMAIN[$BEST_LOG]}"
+      fi
+      # Heuristique supplémentaire: si le mapping CustomLog n'existe pas,
+      # tenter de déduire le vhost depuis le nom du fichier de log ou les fichiers de site.
+      if [[ -z "$CHOSEN_DOMAIN" ]]; then
+        base=$(basename "$BEST_LOG")
+        name_no_ext=${base%%.*}
+        # 1) chercher un fichier de site contenant ce fragment
+        cfg=$(ls /etc/apache2/sites-enabled/*${name_no_ext}* 2>/dev/null | head -1 || true)
+        if [[ -n "$cfg" ]]; then
+          CHOSEN_DOMAIN=$(awk '/^[[:space:]]*ServerName[[:space:]]+/ {print $2; exit}' "$cfg" 2>/dev/null || true)
+        fi
+        # 2) chercher dans tous les sites un ServerName/ServerAlias contenant le fragment
+        if [[ -z "$CHOSEN_DOMAIN" ]]; then
+          CHOSEN_DOMAIN=$(grep -hR "${name_no_ext}" /etc/apache2/sites-enabled 2>/dev/null | awk '/ServerName|ServerAlias/ {print $2}' | head -1 || true)
+        fi
+        # 3) tenter d'extraire le host depuis des URLs absolues présentes dans le log (rare)
+        if [[ -z "$CHOSEN_DOMAIN" ]]; then
+          CHOSEN_DOMAIN=$(awk 'match($0, /https?:\/\/([^\/:\"]+)/, m){cnt[m[1]]++} END{mx=0; d=""; for(k in cnt) if(cnt[k]>mx){mx=cnt[k]; d=k} if(d!="") print d}' "$BEST_LOG" 2>/dev/null || true)
+        fi
+      fi
+      # Page la plus demandée (indépendamment du domaine si per-vhost)
+      # Filtrer les assets statiques pour obtenir une page applicative représentative
+      SKIP_STATIC_RE=${SKIP_STATIC_RE:-"\.(css|js|png|jpg|jpeg|gif|ico|woff2?|svg|map|ttf|eot|otf|mp4|webp)$"}
+      CHOSEN_PATH=$(awk -v skip_re="$SKIP_STATIC_RE" '
+        { if(match($0, /"(GET|POST|HEAD|OPTIONS|PUT|DELETE)[[:space:]]+([^[:space:]]+)/, r)) { path=r[2]; sub(/\?.*/, "", path); lp=tolower(path); if(lp ~ skip_re) next; cnt[path]++ } }
+        END{max=0; p=""; for(k in cnt){ if(cnt[k]>max){max=cnt[k]; p=k} } if(p!=""){print p}}
+      ' "$BEST_LOG" 2>/dev/null || true)
+      if [[ -n "$CHOSEN_PATH" ]]; then
+        echo "[i] Filtre static assets appliqué: SKIP_STATIC_RE=${SKIP_STATIC_RE} -> CHOSEN_PATH=${CHOSEN_PATH}"
+      fi
+    fi
+    # Fallback: si non trouvé, utiliser premier vhost en 443 ou 80, et /
+    DOMAIN_443=$(awk '/port[[:space:]]+443[[:space:]]+namevhost[[:space:]]+/ {print $4; exit}' <<<"$AP_SITES")
+    DOMAIN_80=$(awk '/port[[:space:]]+80[[:space:]]+namevhost[[:space:]]+/ {print $4; exit}' <<<"$AP_SITES")
+    if [[ -z "$CHOSEN_DOMAIN" ]]; then
+      if [[ -n "$DOMAIN_443" ]]; then CHOSEN_DOMAIN="$DOMAIN_443"; fi
+      if [[ -z "$CHOSEN_DOMAIN" && -n "$DOMAIN_80" ]]; then CHOSEN_DOMAIN="$DOMAIN_80"; fi
+    fi
+    if [[ -z "$CHOSEN_PATH" ]]; then CHOSEN_PATH="/"; fi
+
+    # Schéma préférentiel
+    SCHEME="https"
+    if [[ -n "$CHOSEN_DOMAIN" ]]; then
+      # Vérifier si le domaine est présent en 443
+      if ! awk -v d="$CHOSEN_DOMAIN" '/port[[:space:]]+443[[:space:]]+namevhost[[:space:]]+/ {print $4}' <<<"$AP_SITES" | grep -qx "$CHOSEN_DOMAIN"; then
+        SCHEME="http"
+      fi
+    fi
+
+    echo
+    echo "== HTTP/2 vs HTTP/1.1 (curl TTFB) =="
+    CURL_REPS=${CURL_REPS:-10}
+    if command -v curl >/dev/null 2>&1 && [[ -n "$CHOSEN_DOMAIN" ]]; then
+      # Construire l’URL et ajouter un cache-buster
+      BASE_URL="${SCHEME}://${CHOSEN_DOMAIN}${CHOSEN_PATH}"
+      if [[ "$BASE_URL" == *"?"* ]]; then URL="${BASE_URL}&cb=$(date +%s)"; else URL="${BASE_URL}?cb=$(date +%s)"; fi
+      echo "Domaine testé: ${SCHEME}://${CHOSEN_DOMAIN}"
+      echo "Page la plus demandée: ${CHOSEN_PATH}"
+
+      run_curl_reps() {
+        local proto="$1"; shift
+        local url="$1"; shift
+        local out=""; local tmpfile
+        tmpfile=$(mktemp)
+        for i in $(seq 1 $CURL_REPS); do
+          if [[ "$proto" == "h2" ]]; then
+            curl -sS -o /dev/null --max-time 8 --http2 -w "%{time_starttransfer} %{time_total}\n" -H "Cache-Control: no-cache" -H "Pragma: no-cache" -H "Accept-Encoding: identity" "$url" >>"$tmpfile" 2>/dev/null || echo "0 0" >>"$tmpfile"
+          else
+            curl -sS -o /dev/null --max-time 8 --http1.1 -w "%{time_starttransfer} %{time_total}\n" -H "Cache-Control: no-cache" -H "Pragma: no-cache" -H "Accept-Encoding: identity" "$url" >>"$tmpfile" 2>/dev/null || echo "0 0" >>"$tmpfile"
+          fi
+          sleep 0.15
+        done
+        # Calcul moyenne/écart-type via awk: cols 1=ttfb, 2=total
+        awk 'BEGIN{n=0;s1=0;s2=0;t1=0;t2=0} {n++; s1+=$1; s2+=$1*$1; t1+=$2; t2+=$2*$2} END{ if(n==0){print "n=0"; exit} mean1=s1/n; sd1=(s2/n - mean1*mean1); if(sd1<0) sd1=0; sd1=sqrt(sd1); mean2=t1/n; sd2=(t2/n - mean2*mean2); if(sd2<0) sd2=0; sd2=sqrt(sd2); printf("reps=%d mean_ttfb=%.6f sd_ttfb=%.6f mean_total=%.6f sd_total=%.6f\n", n, mean1, sd1, mean2, sd2) }' "$tmpfile"
+        rm -f "$tmpfile"
+      }
+
+      echo "h2 (runs=${CURL_REPS}): "
+      run_curl_reps h2 "$URL"
+      echo "h1.1 (runs=${CURL_REPS}): "
+      run_curl_reps h1.1 "$URL"
+    else
+      echo "[i] Impossible de mesurer h2/h1.1 (curl absent ou domaine non détecté)."
+    fi
   fi
 
   echo "== Audit croisé Apache/MySQL =="
